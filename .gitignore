@@ -12,3 +12,10 @@ wheels/
 # Secrets
 .env
 .env.local
+.env
+documents/
+data/
+
+# 本地编辑器 / IDE 配置（含绝对路径，不入库）
+.vscode/
+pyrightconfig.json
