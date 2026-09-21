@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from openai.types.chat import ChatCompletionMessageToolCall
-from tools import READ_ONLY_TOOLS, TOOL_FUNCTIONS, TOOLS
+from tools import READ_ONLY_TOOLS, TOOL_FUNCTIONS, TOOLS,list_documents, list_memories
 
 load_dotenv()
 
@@ -25,12 +25,16 @@ PROMPT_DIR = Path(__file__).parent / "prompts"
 
 
 def load_system_prompt() -> str:
-    """按文件名顺序拼接 prompts/ 下所有 .md，并注入当前日期。"""
+    """按文件名顺序拼接 prompts/ 下所有 .md，并注入当前日期与知识库清单。"""
     parts = [p.read_text(encoding="utf-8") for p in sorted(PROMPT_DIR.glob("*.md"))]
     prompt = "\n\n".join(parts)
     now = datetime.now()
     weekday = "一二三四五六日"[now.weekday()]
-    return prompt.replace("{date}", f"{now:%Y-%m-%d} 星期{weekday}")
+    return (
+        prompt.replace("{date}", f"{now:%Y-%m-%d} 星期{weekday}")
+        .replace("{documents}", list_documents())
+        .replace("{memories}", list_memories())
+    )
 MAX_TOOL_ROUNDS = 8
 MAX_CLAIM_RETRY = 1 
 # 回复里出现这些词 = 声称状态已改变。若本轮没调对应工具，就是"口头完成"。
@@ -43,8 +47,11 @@ INTENT_HINTS: tuple[str, ...] = (
 # ③ 「声称本轮执行成功」的严格说法。只收动作短语，不收「已完成」这种状态词。
 CLAIM_PATTERNS: dict[str, tuple[str, ...]] = {
     "complete_todo": ("已标记完成", "标记为完成", "已完成标记", "已标记为完成"),
-    "add_todos": ("已保存到待办", "已添加到待办", "已为你保存", "已帮你添加", "已存入待办"),
+    # "已为你保存" 不带"待办"，会和 remember 的回复撞车，收紧为必须带"待办"
+    "add_todos": ("已保存到待办", "已添加到待办", "已帮你添加到待办", "已存入待办"),
     "delete_todo": ("已删除待办", "已删掉该待办", "已移除待办"),
+    "remember": ("已记住", "已记下", "已保存到记忆", "已为你记下", "已更新记忆"),
+    "forget": ("已忘记", "已删除记忆", "已从记忆中删除"),
 }
 
 # ② 出现这些词 = 回复是在「回顾既有状态」或「承认没做」，不是声称本轮执行
@@ -86,6 +93,7 @@ class Agent:
         self.messages: list[ChatCompletionMessageParam] = []
         if system_prompt:
             self.messages.append({"role": "system", "content": system_prompt})
+    #执行工具，输入工具名和参数，把json参数解析python字典再转为关键字参数，传入工具，输出工具执行结果
     def _run_tool(self, call: ChatCompletionMessageToolCall) -> str:
         """执行单个工具调用。出错也要返回字符串，给模型自己纠正的机会。"""
         name = call.function.name
@@ -185,20 +193,23 @@ class Agent:
                     {"role": "tool", "tool_call_id": c.id, "content": result}
                 )
 
-
-
         return "（工具调用超过上限，已停止）", called
 
     def chat(self, user_text: str) -> str:
         """发一轮对话，必要时调用工具，并在检测到「口头完成」时要求模型重来。"""
+        # 上一轮可能刚写入/删除了记忆，system prompt 必须跟着变，
+        # 否则新记忆要等到下次重启才生效，用户会觉得"记了跟没记一样"。
+        if self.messages:
+            self.messages[0]["content"] = load_system_prompt()
         self.messages.append({"role": "user", "content": user_text})
 
         reply = ""
         warn: str | None = None
-
+        called_all: set[str] = set()
         for _attempt in range(MAX_CLAIM_RETRY + 1):
             reply, called = self._turn()
-            warn = check_claim(reply, called) if has_change_intent(user_text) else None
+            called_all |= called          # 跨重试累积，别丢上一轮的成果
+            warn = check_claim(reply, called_all ) if has_change_intent(user_text) else None
             if not warn:
                 break
 

@@ -4,10 +4,12 @@
 不要返回 dict —— 模型要的是自然语言结果，它自己会组织语言。
 """
 from __future__ import annotations
+from array import array
 from datetime import datetime
 import os
 import re
-from collections.abc import Callable
+import math
+from collections.abc import Callable,Sequence
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -15,6 +17,8 @@ import httpx
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionToolParam
+import difflib
+
 load_dotenv()
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -26,6 +30,16 @@ FULL_TEXT_LIMIT = 8000  # 超过这个字数就不再返回全文，改走分块
 CHUNK_SIZE = 3000       # 每块字符数
 CHUNK_OVERLAP = 200     # 块间重叠字数，避免把一段话切碎
 MAX_CHUNKS = 20         # 上限：20 * 3000 = 6 万字，超过就如实拒绝
+KB_CHUNK_SIZE = 500        # 检索块比摘要块小得多：要的是定位精度，不是覆盖面
+KB_CHUNK_OVERLAP = 80
+KB_TOP_K = 5               # 只把最相关的几条塞进上下文
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v3")
+EMBED_BATCH = 10      # 单次请求的文本条数上限，DashScope 有批量限制
+RRF_K = 60            # RRF 系数，越大越"抹平"两路排名差异
+VEC_MIN_SCORE = 0.25   # 余弦低于此值视为不相关，不参与融合
+KB_MIN_POOL = 5   # 某一路命中少于此数，视为该路对本次查询失效，不参与融合
+MEM_SIM_THRESHOLD = 0.75  # 相似度高于此值视为同一条记忆，更新而非新增
+MEM_MAX = 50              # 记忆上限，超了要先清理
 # WMO 天气码 → 中文。不给这张表，模型看到 weather_code=3 只能瞎猜。
 WMO = {
     0: "晴", 1: "大部晴朗", 2: "局部多云", 3: "阴",
@@ -58,7 +72,47 @@ def _init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chunks (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_name  TEXT    NOT NULL,
+                chunk_idx INTEGER NOT NULL,
+                text      TEXT    NOT NULL,
+                mtime     REAL    NOT NULL,
+                UNIQUE(doc_name, chunk_idx)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS terms (
+                term     TEXT    NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                tf       INTEGER NOT NULL,
+                PRIMARY KEY (term, chunk_id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_terms_term ON terms(term)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                content    TEXT    NOT NULL,
+                created_at TEXT    NOT NULL,
+                updated_at TEXT    NOT NULL
+            )
+            """
+        )
+                # 老库升级：chunks 表可能还没有 vec 列（SQLite 不支持 ADD COLUMN IF NOT EXISTS）
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+        if "vec" not in cols:
+            conn.execute("ALTER TABLE chunks ADD COLUMN vec BLOB")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_name)")
         conn.commit()
+
 _init_db()  # 导入时就确保表存在
 # 添加待办
 def _norm(text: str) -> str:
@@ -334,6 +388,376 @@ def read_document(filename: str) -> str:
         return _summarize_long(text, path.name)
 
     return f"文档《{path.name}》全文（{len(text)} 字）：\n\n{text}"
+_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[a-zA-Z0-9]+")
+
+_embed_available: bool | None = None  # None=未验证 True=可用 False=已失败，别再重试
+
+
+def _pack_vec(v: Sequence[float]) -> bytes:
+    return array("f", v).tobytes()
+
+
+def _unpack_vec(b: bytes) -> Sequence[float]:
+    a = array("f")
+    a.frombytes(b)
+    return a
+
+
+
+def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    """余弦相似度。几千个 chunk 的规模下，纯 Python 暴力算只要几十毫秒。"""
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / math.sqrt(na * nb)
+
+
+def _embed(texts: list[str]) -> list[list[float]] | None:
+    """批量向量化。失败就熔断并降级 —— 不能因为 embedding 挂了就让检索整体不可用。"""
+    global _embed_available
+    if _embed_available is False or not texts:
+        return None
+    try:
+        out: list[list[float]] = []
+        for i in range(0, len(texts), EMBED_BATCH):
+            resp = _llm().embeddings.create(
+                model=EMBED_MODEL, input=texts[i : i + EMBED_BATCH]
+            )
+            # 按 index 排序，别假设返回顺序一定等于输入顺序
+            out.extend(d.embedding for d in sorted(resp.data, key=lambda x: x.index))
+        _embed_available = True
+        return out
+    except Exception as e:
+        _embed_available = False
+        print(f"  [索引] embedding 不可用（{type(e).__name__}: {e}），已降级为纯关键词检索。")
+        return None
+
+def _tokenize(text: str) -> list[str]:
+    """中文切 bigram（二字滑动），英文数字按词。零依赖的朴素分词。
+
+    「预算情况」→ ['预算', '算情', '情况']。
+    bigram 让「预算」这种二字词能被直接命中，同时不依赖 jieba。
+    """
+    tokens: list[str] = []
+    for m in _TOKEN_RE.findall(text):
+        if "\u4e00" <= m[0] <= "\u9fff":  # 汉字串
+            if len(m) == 1:
+                tokens.append(m)
+            else:
+                tokens.extend(m[i : i + 2] for i in range(len(m) - 1))
+        else:
+            tokens.append(m.lower())
+    return tokens
+
+
+def _kb_chunks(text: str) -> list[str]:
+    """按字符滑窗切块，块间保留重叠，避免把关键句切断。"""
+    step = KB_CHUNK_SIZE - KB_CHUNK_OVERLAP
+    chunks: list[str] = []
+    for i in range(0, len(text), step):
+        piece = text[i : i + KB_CHUNK_SIZE].strip()
+        if piece:
+            chunks.append(piece)
+        if i + KB_CHUNK_SIZE >= len(text):
+            break
+    return chunks
+
+
+def _drop_doc(conn: sqlite3.Connection, name: str) -> None:
+    """清掉某文档的索引（重建前 / 文件已删除时）。"""
+    ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_name=?", (name,))]
+    if not ids:
+        return
+    conn.execute(f"DELETE FROM terms WHERE chunk_id IN ({','.join('?' * len(ids))})", ids)
+    conn.execute("DELETE FROM chunks WHERE doc_name=?", (name,))
+
+
+def _index_doc(conn: sqlite3.Connection, name: str, text: str, mtime: float) -> int:
+    """重建单个文档的索引：先删旧，再插新，最后补向量。"""
+    _drop_doc(conn, name)
+    chunks = _kb_chunks(text)
+    ids: list[int] = []
+
+    for idx, chunk in enumerate(chunks):
+        cur = conn.execute(
+            "INSERT INTO chunks (doc_name, chunk_idx, text, mtime) VALUES (?,?,?,?)",
+            (name, idx, chunk, mtime),
+        )
+        cid = cur.lastrowid
+        if cid is None:  # 插入未返回 rowid，跳过，避免后面拿到 None
+            continue
+        ids.append(cid)
+        counts: dict[str, int] = {}
+        for t in _tokenize(chunk):
+            counts[t] = counts.get(t, 0) + 1
+        conn.executemany(
+            "INSERT OR REPLACE INTO terms (term, chunk_id, tf) VALUES (?,?,?)",
+            [(t, cid, c) for t, c in counts.items()],
+        )
+
+    vecs = _embed(chunks)
+    if vecs and len(vecs) == len(ids):
+        conn.executemany(
+            "UPDATE chunks SET vec=? WHERE id=?",
+            [(_pack_vec(v), cid) for v, cid in zip(vecs, ids)],
+        )
+    return len(ids)
+
+
+
+def _ensure_index(conn: sqlite3.Connection) -> None:
+    """让索引跟磁盘保持一致：改动过的重建，已删除的清掉。靠 mtime 判断。"""
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    on_disk = {
+        p.name: p.stat().st_mtime
+        for p in DOCS_DIR.iterdir()
+        if p.suffix.lower() in SUPPORTED_SUFFIX
+    }
+    indexed = {
+        r["doc_name"]: r["mtime"]
+        for r in conn.execute(
+            "SELECT doc_name, MAX(mtime) AS mtime FROM chunks GROUP BY doc_name"
+        )
+    }
+
+    for name in set(indexed) - set(on_disk):
+        _drop_doc(conn, name)
+
+    for name, mtime in on_disk.items():
+        if indexed.get(name) != mtime:
+            _index_doc(conn, name, _read_text(DOCS_DIR / name), mtime)
+        # 老索引（加 vec 列之前建的）没有向量，补齐；embedding 不可用时 _embed 返回 None，直接跳过
+    todo = conn.execute("SELECT id, text FROM chunks WHERE vec IS NULL").fetchall()
+    if todo:
+        vecs = _embed([r["text"] for r in todo])
+        if vecs and len(vecs) == len(todo):
+            conn.executemany(
+                "UPDATE chunks SET vec=? WHERE id=?",
+                [(_pack_vec(v), r["id"]) for v, r in zip(vecs, todo)],
+            )
+
+    conn.commit()
+
+def _bm25_scores(conn: sqlite3.Connection, qterms: list[str]) -> dict[int, float]:
+    """BM25 打分。-- 原 search_knowledge 里的打分逻辑，抽出来好跟向量路平级。"""
+    if not qterms:
+        return {}
+    ph = ",".join("?" * len(qterms))
+    total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    df = {
+        r[0]: r[1]
+        for r in conn.execute(
+            f"SELECT term, COUNT(*) FROM terms WHERE term IN ({ph}) GROUP BY term",
+            qterms,
+        )
+    }
+    avgdl = conn.execute("SELECT AVG(LENGTH(text)) FROM chunks").fetchone()[0] or 1.0
+    rows = conn.execute(
+        f"""
+        SELECT c.id, t.term, t.tf, LENGTH(c.text) AS dl
+        FROM terms t JOIN chunks c ON c.id = t.chunk_id
+        WHERE t.term IN ({ph})
+        """,
+        qterms,
+    ).fetchall()
+
+    k1, b = 1.5, 0.75
+    scores: dict[int, float] = {}
+    for r in rows:
+        d = df.get(r["term"], 0)
+        idf = math.log(1 + (total - d + 0.5) / (d + 0.5)) if d else 0.0
+        tf, dl = r["tf"], r["dl"] or 1
+        scores[r["id"]] = scores.get(r["id"], 0.0) + idf * (tf * (k1 + 1)) / (
+            tf + k1 * (1 - b + b * dl / avgdl)
+        )
+    return scores
+
+
+def _vec_scores(conn: sqlite3.Connection, query: str) -> dict[int, float]:
+    """向量路：query 整句向量化，与所有 chunk 算余弦。不做分词 —— 这正是它的优势。"""
+    rows = conn.execute("SELECT id, vec FROM chunks WHERE vec IS NOT NULL").fetchall()
+    if not rows:
+        return {}
+    q = _embed([query])
+    if not q:
+        return {}
+    qv = q[0]
+    return {
+        r["id"]: s
+        for r in rows
+        if (s := _cosine(qv, _unpack_vec(r["vec"]))) >= VEC_MIN_SCORE
+    }
+
+
+def _rrf(pools: list[dict[int, float]], k: int = RRF_K) -> dict[int, float]:
+    """RRF 融合：只看名次不看分数，绕开两路量纲不可比的问题。"""
+    fused: dict[int, float] = {}
+    for scores in pools:
+        for rank, cid in enumerate(sorted(scores, key=lambda c: -scores[c]), 1):
+            fused[cid] = fused.get(cid, 0.0) + 1.0 / (k + rank)
+    return fused
+
+def search_knowledge(query: str, top_k: int = KB_TOP_K, mode: str = "hybrid") -> str:
+    """在个人知识库里检索：关键词(BM25) + 语义(embedding)，RRF 融合取 Top-K。
+
+    mode: hybrid(默认，两路融合) / keyword(纯关键词) / semantic(纯语义)。
+    """
+    top_k = max(1, min(int(top_k), 10))
+    mode = (mode or "hybrid").lower()
+    if mode not in {"hybrid", "keyword", "semantic"}:
+        mode = "hybrid"
+
+    with closing(_connect()) as conn:
+        _ensure_index(conn)
+
+        total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        if total == 0:
+            return "知识库是空的：documents/ 目录下还没有可索引的 .md / .txt 文档。"
+
+        meta = {
+            r["id"]: (r["doc_name"], r["text"])
+            for r in conn.execute("SELECT id, doc_name, text FROM chunks")
+        }
+        qterms = sorted(set(_tokenize(query)))
+
+        bm25 = {} if mode == "semantic" else _bm25_scores(conn, qterms)
+        vec = {} if mode == "keyword" else _vec_scores(conn, query)
+
+        if mode == "keyword":
+            fused = bm25
+        elif mode == "semantic":
+            fused = vec
+        else:
+            # 某一路候选太少 = 它对这个查询基本失效，它的"第 1 名"含金量很低，
+            # 参与融合只会污染结果（RRF 会给它 1/(k+1) 的最高档分数）。
+            pools = [p for p in (bm25, vec) if len(p) >= KB_MIN_POOL]
+            fused = _rrf(pools) if len(pools) > 1 else (bm25 or vec)
+
+        with closing(_connect()) as conn:
+            n_vec = conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE vec IS NOT NULL"
+            ).fetchone()[0]
+        print(
+            f"  [检索] 模式={mode}｜关键词命中 {len(bm25)} 条，语义候选 {len(vec)} 条"
+            f"｜知识库 {len(meta)} 块，其中 {n_vec} 块已向量化"
+        )
+
+
+    if not fused:
+        return (
+            f"没有找到与「{query}」相关的文档内容。"
+            f"可以换个更贴近文档用词的说法再试，或调用 list_documents 确认有哪些文档。"
+        )
+
+    ranked = sorted(fused.items(), key=lambda x: -x[1])[:top_k]
+    blocks = []
+    for i, (cid, s) in enumerate(ranked, 1):
+        doc, text = meta[cid]
+        hits = "+".join(
+            t for t, pool in (("关键词", bm25), ("语义", vec)) if cid in pool
+        ) or "无"
+        blocks.append(
+            f"[{i}] 来自《{doc}》｜融合分 {s:.4f}｜命中：{hits}\n{text}"
+        )
+
+    return (
+        f"共 {len(fused)} 个候选片段，以下是最相关的 {len(ranked)} 条：\n\n"
+        + "\n\n".join(blocks)
+        + "\n\n（以上是知识库中的原文片段，是回答的唯一依据。"
+        "片段里没有的信息，请如实说明文档中未提到，不要用自己的知识补充。）"
+    )
+
+# ---------- 长期记忆 ----------
+
+
+def list_memories() -> str:
+    """返回全部记忆，用于注入系统提示词。不给模型调用，所以不注册进 TOOLS。"""
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            "SELECT id, content FROM memories ORDER BY id"
+        ).fetchall()
+
+    if not rows:
+        return "（暂无记忆）"
+    return "\n".join(f"- #{r['id']} {r['content']}" for r in rows)
+
+
+def remember(content: str) -> str:
+    """记住一条关于用户的长期事实或偏好，跨会话保留。
+
+    只记长期稳定的信息：身份、职业、所在地、习惯、偏好、长期项目背景。
+    不要记：一次性任务（如"查天气"）、documents 里能检索到的事实、
+    敏感凭证（密码、卡号、证件号）、你的推测。
+    """
+    content = content.strip()
+    if not content:
+        return "记忆内容为空，未写入。"
+    if len(content) > 200:
+        return "这条内容太长，请压缩成一句话（200 字以内）再记。"
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    key = _norm(content)
+
+    with closing(_connect()) as conn:
+        rows = conn.execute("SELECT id, content FROM memories").fetchall()
+
+        # 完全一样：直接跳过
+        for r in rows:
+            if _norm(r["content"]) == key:
+                return f"这条已经记过了（#{r['id']}）：{r['content']}"
+
+        # 高度相似 = 同一件事的新说法，更新旧的，绝不并存两条矛盾的
+        for r in rows:
+            ratio = difflib.SequenceMatcher(None, key, _norm(r["content"])).ratio()
+            if ratio >= MEM_SIM_THRESHOLD:
+                conn.execute(
+                    "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
+                    (content, now, r["id"]),
+                )
+                conn.commit()
+                return f"已更新记忆 #{r['id']}：{r['content']} → {content}"
+
+        if len(rows) >= MEM_MAX:
+            return f"记忆已满（{MEM_MAX} 条），请先调用 forget 清理。"
+
+        cur = conn.execute(
+            "INSERT INTO memories (content, created_at, updated_at) VALUES (?, ?, ?)",
+            (content, now, now),
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+
+    return f"已记住 #{new_id}：{content}"
+
+
+def forget(content: str) -> str:
+    """删除记忆。content 可以是原话，也可以是其中的关键词。"""
+    key = _norm(content)
+    if not key:
+        return "请说明要删除哪条记忆。"
+
+    with closing(_connect()) as conn:
+        rows = conn.execute("SELECT id, content FROM memories").fetchall()
+        # 先精确包含，再模糊相似
+        hit = [r for r in rows if key in _norm(r["content"])]
+        if not hit:
+            hit = [
+                r
+                for r in rows
+                if difflib.SequenceMatcher(None, key, _norm(r["content"])).ratio() >= 0.5
+            ]
+        if not hit:
+            return f"没有找到与「{content}」相关的记忆（当前共 {len(rows)} 条）。"
+
+        for r in hit:
+            conn.execute("DELETE FROM memories WHERE id = ?", (r["id"],))
+        conn.commit()
+
+    return "已删除记忆：\n" + "\n".join(f"- #{r['id']} {r['content']}" for r in hit)
 
 # 工具的「说明书」：模型靠它决定要不要用、怎么用
 TOOLS: list[ChatCompletionToolParam] = [
@@ -476,6 +900,93 @@ TOOLS: list[ChatCompletionToolParam] = [
             },
         },
     },
+        {
+        "type": "function",
+        "function": {
+            "name": "search_knowledge",
+            "description": (
+                "在个人知识库（documents 目录下所有文档）中检索与问题相关的原文片段。"
+                "**凡涉及具体数据、事实、细节的问题——金额、预算、日期、人名、指标、"
+                "某句话怎么说的、某个结论是什么——都必须先调用本工具检索，"
+                "不要直接回答，也不要因为用户没提「文档」「报告」二字就跳过检索。**"
+                "检索到就依据片段回答并注明来自哪个文档；确实检索不到，才能说知识库里没有。"
+                "与 read_document 的区别：要总结某个指定文件的整篇内容时用 read_document；"
+                "要查找具体信息时用本工具。"
+                "返回的是原文片段，只能依据片段回答，片段里没有的不要编造。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "检索问题或关键词，保留关键名词，例如「预算 投入 金额」",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返回几条片段，默认 5，最多 10。一般不用改。",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["hybrid", "keyword", "semantic"],
+                        "description": (
+                            "检索方式。hybrid=关键词+语义融合（默认，最准）；"
+                            "keyword=纯关键词；semantic=纯语义。"
+                            "只有在用户明确要求「用语义检索」「对比一下两种检索」时才指定，"
+                            "平时不要传。"
+                        ),
+                    },
+
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "把关于用户的一条长期事实或偏好写入记忆，跨会话保留。"
+                "当用户说「记住…」「以后都…」「别忘了…」，"
+                "或主动说出稳定的个人信息（身份、职业、所在地、习惯、偏好）时调用。"
+                "**不要记**：一次性任务、documents 里检索得到的内容、"
+                "敏感凭证（密码/卡号/证件号）、你的推测——存疑时不记。"
+                "内容相近的旧记忆会被自动更新，你不必自己判断是否重复。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "要记住的内容，一句话，例如「用户在杭州工作」",
+                    }
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget",
+            "description": (
+                "删除一条已记住的内容。"
+                "当用户说「忘掉…」「别记了」「那个不准」时调用。"
+                "参数是原话或其中的关键词，不需要精确的完整句子。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "要删除的记忆原文或关键词，例如「杭州」",
+                    }
+                },
+                "required": ["content"],
+            },
+        },
+    },
+
 ]
 
 
@@ -488,11 +999,14 @@ TOOL_FUNCTIONS: dict[str, Callable[..., str]] = {
     "read_document": read_document,
     "complete_todo": complete_todo,
     "delete_todo": delete_todo,
+    "search_knowledge": search_knowledge,
+    "remember": remember,
+    "forget": forget,
 }
 # 可以并发执行的工具：只读或纯网络 I/O，彼此无状态冲突。
 # 写数据库的工具串行执行，避免 sqlite 锁竞争。
 READ_ONLY_TOOLS = frozenset(
-    {"get_weather", "list_todos", "list_documents", "read_document"}
+    {"get_weather", "list_todos", "list_documents", "read_document", "search_knowledge"}
 )
 
 
