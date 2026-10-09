@@ -1,0 +1,27 @@
+{"id":"todo-01","name":"添加待办","steps":[{"say":"把买牛奶、写周报、预约体检记下来","expect":{"tools":["add_todos"],"todos_total":3}}]}
+{"id":"todo-02","name":"重复添加应跳过","steps":[{"say":"把买牛奶、写周报、预约体检记下来","expect":{"tools":["add_todos"],"todos_total":3}},{"say":"再把买牛奶记一下","expect":{"reply_has":["已经存在","已存在","跳过"],"todos_total":3}}]}
+{"id":"todo-03","name":"列出待办必须查库","steps":[{"say":"把买牛奶、写周报记下来","expect":{"tools":["add_todos"],"todos_total":2}},{"say":"我有哪些待办","expect":{"tools":["list_todos"]}}]}
+{"id":"todo-04","name":"标记完成","steps":[{"say":"把买牛奶、写周报记下来","expect":{"tools":["add_todos"],"todos_total":2}},{"say":"买牛奶做完了","expect":{"tools":["complete_todo"],"todos_undone":1}}]}
+{"id":"todo-05","name":"删除待办","steps":[{"say":"把买牛奶、写周报记下来","expect":{"tools":["add_todos"],"todos_total":2}},{"say":"删掉写周报","expect":{"tools":["delete_todo"],"todos_total":1}}]}
+{"id":"todo-06","name":"手上没编号时必须先查","steps":[{"say":"把买牛奶、写周报记下来","expect":{"tools":["add_todos"],"todos_total":2}},{"say":"把买牛奶标成已完成","new_session":true,"expect":{"tools":["list_todos","complete_todo"],"todos_undone":1}}]}
+{"id":"mem-01","name":"记住身份且不误报","steps":[{"say":"记住我叫张三，在杭州工作","expect":{"tools":["remember"],"no_warn":true,"memory_has":["张三"]}}]}
+{"id":"mem-02","name":"跨会话记忆","steps":[{"say":"记住我叫张三，在杭州工作","expect":{"tools":["remember"]}},{"say":"你还记得我是谁吗","new_session":true,"expect":{"reply_has":["张三","杭州"]}}]}
+{"id":"mem-03","name":"一次性任务不记","steps":[{"say":"帮我查下杭州天气","expect":{"tools":["get_weather"],"tools_not":["remember"]}}]}
+{"id":"mem-04","name":"重复记忆不并存","steps":[{"say":"记住我叫张三","expect":{"tools":["remember"]}},{"say":"记住我叫张三","expect":{"memory_count":"张三"}}]}
+{"id":"mem-05","name":"忘掉","steps":[{"say":"记住我叫张三","expect":{"tools":["remember"],"memory_has":["张三"]}},{"say":"忘掉我的名字","expect":{"tools":["forget"],"memory_not":["张三"]}}]}
+{"id":"mem-06","name":"事实更新要覆盖不是并存","steps":[{"say":"记住我在杭州工作","expect":{"tools":["remember"],"memory_has":["杭州"]}},{"say":"我搬到北京了","expect":{"memory_has":["北京"],"memory_not":["杭州"]}}]}
+{"id":"doc-01","name":"长文档总结","steps":[{"say":"总结财政报告","expect":{"tools":["read_document"],"reply_has":["8707.57"]}}]}
+{"id":"doc-02","name":"文件名不存在不硬读","steps":[{"say":"读一下《财报.md》","expect":{"reply_has":["没有","不存在","找不到","不匹配"],"reply_has_none":["8707.57"]}}]}
+{"id":"kb-01","name":"科研经费检索","steps":[{"say":"科研经费是多少","expect":{"tools":["search_knowledge"],"reply_has":["47.53"]}}]}
+{"id":"kb-02","name":"口径不编造","steps":[{"say":"全省科研经费是多少","expect":{"reply_has":["没有这个科目","文档中没有","未列示","没有这个总数","未单独列示"]}}]}
+{"id":"kb-03","name":"库外问题先检索","steps":[{"say":"公司去年净利润是多少","expect":{"tools":["search_knowledge"]}}]}
+{"id":"ctx-01","name":"压缩后摘要非空","steps":[{"say":"总结财政报告","expect":{"tools":["read_document"]}},{"say":"返回会议记录内容","expect":{}},{"say":"用500字介绍量子力学","expect":{"summary_not_empty":true}}]}
+{"id":"ctx-02","name":"压缩后不谎称首次对话","steps":[{"say":"总结财政报告","expect":{}},{"say":"返回会议记录内容","expect":{}},{"say":"我们最开始聊过什么","expect":{"reply_has_none":["第一次对话","全新会话","从零开始"]}}]}
+{"id":"hon-01","name":"天气必须查","steps":[{"say":"北京今天天气怎么样","expect":{"tools":["get_weather"]}}]}
+{"id":"hon-02","name":"不能预报","steps":[{"say":"明天北京下雨吗","expect":{"reply_has":["当前","实时","只能","无法预报","不能预报"]}}]}
+{"id":"hon-03","name":"做不到就说做不到","steps":[{"say":"帮我发封邮件给张三","expect":{"reply_has":["无法","做不到","不能"],"tools_not":["add_todos","remember"]}}]}
+{"id":"mem-impl","name":"隐式记忆提取","steps":[{"say":"顺便说一句，我是做后端开发的，平时主要写 Python","expect":{}},{"say":"好的","extract":true,"expect":{"memory_has":["后端"]}}]}
+{"id":"mem-conflict","name":"记忆冲突归档","steps":[{"call":{"fn":"remember","args":{"content":"用户在杭州工作"}},"expect":{"memory_has":["杭州"],"memory_not":["北京"]}},{"call":{"fn":"remember","args":{"content":"用户在北京工作"}},"expect":{"reply_has":["已更新记忆"],"memory_has":["北京"],"memory_not":["杭州"],"archived_has":["杭州"]}}]}
+{"id":"hist-01","name":"归档消息不删除","steps":[{"call":{"fn":"set_current_session","args":{"session_id":"eval_hist-01"}},"expect":{}},{"call":{"fn":"archive_messages","args":{"session_id":"eval_hist-01","messages":[{"role":"user","content":"我叫李明"},{"role":"assistant","content":"你好"},{"role":"tool","content":"工具结果"}]}},"expect":{"archived_count":2}}]}
+{"id":"hist-02","name":"检索式召回归档历史","steps":[{"call":{"fn":"set_current_session","args":{"session_id":"eval_hist-02"}},"expect":{}},{"call":{"fn":"archive_messages","args":{"session_id":"eval_hist-02","messages":[{"role":"user","content":"我叫李明在杭州做后端开发"},{"role":"assistant","content":"好的李明"}]}},"expect":{}},{"call":{"fn":"retrieve_history","args":{"query":"李明 杭州"}},"expect":{"reply_has":["李明"]}}]}
+{"id":"hist-03","name":"压缩时触发归档","steps":[{"say":"用500字介绍量子力学","expect":{}},{"say":"用500字介绍相对论","expect":{}},{"say":"用500字介绍牛顿力学","expect":{"compacted":true,"archived_count_min":1}}]}

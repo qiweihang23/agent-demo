@@ -18,27 +18,40 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionToolParam
 import difflib
+import json
+# 当前会话 id，供 retrieve_history 等需要按会话过滤的工具读取
+# 由 agent.chat() 在每轮开始时设置
+_CURRENT_SESSION: str = "default"
 
+def set_current_session(session_id: str) -> None:
+    """设置当前会话 id，供工具内部按会话过滤数据时读取。"""
+    global _CURRENT_SESSION
+    _CURRENT_SESSION = session_id
+
+# 当前用户 id，供 remember/forget/list_memories 等需要按用户过滤数据的工具读取
+_CURRENT_USER: str = "default"
+
+def set_current_user(user_id: str) -> None:
+    """设置当前用户 id，由 agent 在启动时注入。工具签名里永远不暴露这个参数。"""
+    global _CURRENT_USER
+    _CURRENT_USER = user_id
+from typing import Any
 load_dotenv()
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 DATA_DIR = Path(__file__).parent / "data"
 DB_PATH = DATA_DIR / "assistant.db"
 DOCS_DIR = Path(__file__).parent / "documents"
-SUPPORTED_SUFFIX = {".md", ".txt"}
+SUPPORTED_SUFFIX = {".md", ".txt", ".csv", ".xlsx", ".pdf", ".docx"}
 FULL_TEXT_LIMIT = 8000  # 超过这个字数就不再返回全文，改走分块摘要
 CHUNK_SIZE = 3000       # 每块字符数
 CHUNK_OVERLAP = 200     # 块间重叠字数，避免把一段话切碎
 MAX_CHUNKS = 20         # 上限：20 * 3000 = 6 万字，超过就如实拒绝
-KB_CHUNK_SIZE = 500        # 检索块比摘要块小得多：要的是定位精度，不是覆盖面
-KB_CHUNK_OVERLAP = 80
-KB_TOP_K = 5               # 只把最相关的几条塞进上下文
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v3")
 EMBED_BATCH = 10      # 单次请求的文本条数上限，DashScope 有批量限制
-RRF_K = 60            # RRF 系数，越大越"抹平"两路排名差异
-VEC_MIN_SCORE = 0.25   # 余弦低于此值视为不相关，不参与融合
-KB_MIN_POOL = 5   # 某一路命中少于此数，视为该路对本次查询失效，不参与融合
-MEM_SIM_THRESHOLD = 0.75  # 相似度高于此值视为同一条记忆，更新而非新增
+MEM_SIM_THRESHOLD = 0.65  # 相似度高于此值视为同一条记忆，更新而非新增
+MEM_VEC_THRESHOLD = 0.82  # 语义高置信线：直接归档，不问 LLM。只影响成本，不影响正确性
+MEM_VEC_RECALL = 0.45    # 语义召回线：之上的中段候选交给 LLM 判定冲突
 MEM_MAX = 50              # 记忆上限，超了要先清理
 # WMO 天气码 → 中文。不给这张表，模型看到 weather_code=3 只能瞎猜。
 WMO = {
@@ -66,11 +79,24 @@ def _init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS todos (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT    NOT NULL DEFAULT 'default',
                 text       TEXT    NOT NULL,
                 done       INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT    NOT NULL
             )
             """
+        )
+        # 老库升级：todos 表补 session_id（按会话隔离）。
+        # ALTER ADD COLUMN 不支持 IF NOT EXISTS，只能先 PRAGMA 查再补；
+        # 带 NOT NULL 必须同时给 DEFAULT，且现存旧行会被填成这个默认值——
+        # 借这个特性一步完成「补列 + 回填」，旧待办自动归入 default 会话。
+        tcols = {r[1] for r in conn.execute("PRAGMA table_info(todos)")}
+        if "session_id" not in tcols:
+            conn.execute(
+                "ALTER TABLE todos ADD COLUMN session_id TEXT NOT NULL DEFAULT 'default'"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id, done, id)"
         )
         conn.execute(
             """
@@ -98,19 +124,130 @@ def _init_db() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS memories (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       TEXT    NOT NULL DEFAULT 'default',
+                content       TEXT    NOT NULL,
+                created_at    TEXT    NOT NULL,
+                updated_at    TEXT    NOT NULL,
+                valid_to      TEXT,
+                superseded_by INTEGER,
+                vec           BLOB
+            )
+            """
+        )
+        # 老库升级：memories 表补缺失列（SQLite 不支持 ADD COLUMN IF NOT EXISTS）。
+        # user_id 的 DEFAULT 同样兼做旧数据回填：老记忆自动归入 default 用户。
+        mcols = {r[ 1 ] for r in conn.execute( "PRAGMA table_info(memories)" )} 
+        if "user_id" not in mcols:
+            conn.execute( "ALTER TABLE memories ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'" )
+        if "valid_to" not in mcols:
+            conn.execute( "ALTER TABLE memories ADD COLUMN valid_to TEXT" ) 
+        if "superseded_by" not in mcols:
+            conn.execute( "ALTER TABLE memories ADD COLUMN superseded_by INTEGER" )
+        if "vec" not in mcols:
+            conn.execute( "ALTER TABLE memories ADD COLUMN vec BLOB" )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, valid_to)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                content    TEXT    NOT NULL,
-                created_at TEXT    NOT NULL,
+                session_id TEXT    NOT NULL,
+                role       TEXT    NOT NULL,
+                payload    TEXT    NOT NULL,
+                created_at TEXT    NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS summaries (
+                session_id TEXT PRIMARY KEY,
+                fine_summary   TEXT    NOT NULL DEFAULT '',
+                coarse_summary TEXT    NOT NULL DEFAULT '',
                 updated_at TEXT    NOT NULL
             )
             """
         )
-                # 老库升级：chunks 表可能还没有 vec 列（SQLite 不支持 ADD COLUMN IF NOT EXISTS）
+        # 老库迁移：原来只有 summary 一列，迁到 fine_summary，coarse 留空 scols = {r[ 1 ] for r in conn.execute( "PRAGMA table_info(summaries)" )} if "fine_summary" not in scols:
+        scols = {r[ 1 ] for r in conn.execute( "PRAGMA table_info(summaries)" )}
+        if "fine_summary" not in scols:
+            conn.execute( "ALTER TABLE summaries ADD COLUMN fine_summary TEXT NOT NULL DEFAULT ''" )
+            conn.execute( "UPDATE summaries SET fine_summary = summary WHERE summary IS NOT NULL" )
+        if "coarse_summary" not in scols:   
+            conn.execute( "ALTER TABLE summaries ADD COLUMN coarse_summary TEXT NOT NULL DEFAULT ''" )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS archived_messages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT    NOT NULL,
+                role        TEXT    NOT NULL,
+                payload     TEXT    NOT NULL,
+                text        TEXT,
+                created_at  TEXT    NOT NULL,
+                archived_at TEXT    NOT NULL,
+                vec         BLOB    
+            )
+            """
+        )
+        # 老库补列 
+        acols = {r[ 1 ] for r in conn.execute( "PRAGMA table_info(archived_messages)" )}
+        if "vec" not in acols:
+            conn.execute( "ALTER TABLE archived_messages ADD COLUMN vec BLOB" )
+        if "text" not in acols: 
+            conn.execute( "ALTER TABLE archived_messages ADD COLUMN text TEXT" )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS terms_archived (
+                term     TEXT    NOT NULL,
+                msg_id   INTEGER NOT NULL,
+                tf       INTEGER NOT NULL,
+                PRIMARY KEY (term, msg_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_terms_archived_term ON terms_archived(term)"
+        )
+        # 老库补 vec 列
+        acols = {r[1] for r in conn.execute("PRAGMA table_info(archived_messages)")}
+        if "vec" not in acols:
+            conn.execute("ALTER TABLE archived_messages ADD COLUMN vec BLOB")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_archived_session ON archived_messages(session_id, id)"
+        )
+
+        # 老库升级：chunks 表可能还没有 vec 列（SQLite 不支持 ADD COLUMN IF NOT EXISTS）
         cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
         if "vec" not in cols:
             conn.execute("ALTER TABLE chunks ADD COLUMN vec BLOB")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_name)")
+
+        # B-5：长期目标表。粒度比 todos 大—— todos 是单步动作，
+        # goals 是跨多次对话推进的成果，有状态机和进度日志。
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS goals (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id          TEXT    NOT NULL DEFAULT 'default',
+                description     TEXT    NOT NULL,
+                success_criteria TEXT    NOT NULL,
+                status           TEXT    NOT NULL DEFAULT 'pending',
+                progress_log     TEXT    NOT NULL DEFAULT '[]',
+                created_at       TEXT    NOT NULL,
+                updated_at       TEXT    NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_goals_user_status ON goals(user_id, status)"
+        )
+
         conn.commit()
 
 _init_db()  # 导入时就确保表存在
@@ -119,8 +256,38 @@ def _norm(text: str) -> str:
     """归一化待办文本：去掉所有空白，用于判断是否重复。"""
     return re.sub(r"\s+", "", text)
 
-def add_todos(items: list[str]) -> str:
-    """批量添加待办。已存在的条目自动跳过，不重复添加。"""
+# 相似度阈值：>= 此值视为疑似重复，跳过。
+# 0.85 能抓住「去买蛋糕」vs「买蛋糕」（≈0.86），
+# 但不会误杀「买蛋糕」vs「买蛋糕粉」（≈0.86，会误杀 —— 短文本固有限制）。
+# 宁可漏检（用户多一条重复待办）也不要误杀（用户丢失待办），所以阈值偏高。
+_TODO_SIMILAR_THRESHOLD = 0.85
+
+def _find_similar(text: str, exist: dict[str, dict]) -> str | None:
+    """在已存在的归一化文本里找最相似的一条，超过阈值则返回其原始文本。
+
+    exist 的 key 是 _norm 后的文本，value 含 id。
+    返回命中条目的归一化 key，或 None。
+    """
+    key = _norm(text)
+    best_key: str | None = None
+    best_ratio = 0.0
+    for ex_key in exist:
+        ratio = difflib.SequenceMatcher(None, key, ex_key).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_key = ex_key
+    if best_ratio >= _TODO_SIMILAR_THRESHOLD:
+        return best_key
+    return None
+
+def add_todos(items: list[str], session_id: str | None = None) -> str:
+    """批量添加待办。已存在的条目自动跳过，不重复添加。
+
+    session_id 给程序入口（MCP server 等）显式指定会话；为 None 时回退到
+    set_current_session() 注入的当前会话。注意它【不在 TOOLS schema 里】，
+    function-calling 路径的模型看不到也传不了，只有 Python 调用方能用。
+    """
+    sid = session_id or _CURRENT_SESSION
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     added: list[str] = []
     skipped: list[str] = []
@@ -128,7 +295,10 @@ def add_todos(items: list[str]) -> str:
     with closing(_connect()) as conn:
         exist = {
             _norm(r["text"]): {"id": r["id"]}
-            for r in conn.execute("SELECT id, text FROM todos").fetchall()
+            for r in conn.execute(
+                "SELECT id, text FROM todos WHERE session_id = ?",
+                (sid,),
+            ).fetchall()
         }
         for text in items:
             key = _norm(text)
@@ -137,9 +307,14 @@ def add_todos(items: list[str]) -> str:
             if key in exist:
                 skipped.append(f"{text}（已存在 #{exist[key]['id']}）")
                 continue
+            # 精确匹配未命中 → 试试相似度查重（difflib）
+            sim_key = _find_similar(text, exist)
+            if sim_key is not None:
+                skipped.append(f"{text}（疑似重复 #{exist[sim_key]['id']}：{sim_key}）")
+                continue
             cur = conn.execute(
-                "INSERT INTO todos (text, done, created_at) VALUES (?, ?, ?)",
-                (text, 0, now),
+                "INSERT INTO todos (session_id, text, done, created_at) VALUES (?, ?, ?, ?)",
+                (sid, text, 0, now),
             )
             new_id = cur.lastrowid
             added.append(f"#{new_id} {text}")
@@ -151,44 +326,216 @@ def add_todos(items: list[str]) -> str:
         blocks.append(f"已添加 {len(added)} 条：\n" + "\n".join(added))
     if skipped:
         blocks.append(
-            f"跳过 {len(skipped)} 条（已有相同内容，未重复添加）：\n"
+            f"跳过 {len(skipped)} 条（已有相同或相似内容，未重复添加）：\n"
             + "\n".join(skipped)
         )
-    return "\n".join(blocks) if blocks else "没有需要添加的新待办（全部已存在）。"
+    return "\n".join(blocks) if blocks else "没有需要添加的新待办（全部已存在或相似）。"
 #标记待办为已完成
-def complete_todo(todo_id: int) -> str:
-    """把某条待办标记为已完成。"""
+def complete_todo(todo_id: int, session_id: str | None = None) -> str:
+    """把某条待办标记为已完成。session_id 语义同 add_todos。"""
+    sid = session_id or _CURRENT_SESSION
     todo_id = int(todo_id)  # 模型偶尔会传字符串，容错一下
     with closing(_connect()) as conn:
         row = conn.execute(
-            "SELECT id, text FROM todos WHERE id = ?", (todo_id,)
+            "SELECT id, text FROM todos WHERE id = ? AND session_id = ?",
+            (todo_id, sid),
         ).fetchone()
         if row is None:
             return f"没有编号为 #{todo_id} 的待办。请先调用 list_todos 确认编号。"
-        conn.execute("UPDATE todos SET done = 1 WHERE id = ?", (todo_id,))
+        conn.execute(
+            "UPDATE todos SET done = 1 WHERE id = ? AND session_id = ?",
+            (todo_id, sid),
+        )
         conn.commit()
     return f"已完成 #{todo_id} {row['text']}。"
 
 #彻底删除待办
-def delete_todo(todo_id: int) -> str:
-    """彻底删除某条待办。"""
+def delete_todo(todo_id: int, session_id: str | None = None) -> str:
+    """彻底删除某条待办。session_id 语义同 add_todos。"""
+    sid = session_id or _CURRENT_SESSION
     todo_id = int(todo_id)
     with closing(_connect()) as conn:
         row = conn.execute(
-            "SELECT id, text FROM todos WHERE id = ?", (todo_id,)
+            "SELECT id, text FROM todos WHERE id = ? AND session_id = ?",
+            (todo_id, sid),
         ).fetchone()
         if row is None:
             return f"没有编号为 #{todo_id} 的待办。请先调用 list_todos 确认编号。"
-        conn.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+        conn.execute(
+            "DELETE FROM todos WHERE id = ? AND session_id = ?",
+            (todo_id, sid),
+        )
         conn.commit()
     return f"已删除 #{todo_id} {row['text']}。"
 
 # 列出待办
-def list_todos() -> str:
-    """列出所有待办，未完成在前。"""
+def create_goal(description: str, success_criteria: str) -> str:
+    """创建一个长期目标。description 是目标描述，success_criteria 是可验证的达成标准。
+    区别于 todos：todos 是单步动作，goals 是跨多次对话推进的成果，有状态机。
+    """
+    uid = _CURRENT_USER
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            "INSERT INTO goals (user_id, description, success_criteria, status, "
+            "progress_log, created_at, updated_at) VALUES (?, ?, ?, 'pending', '[]', ?, ?)",
+            (uid, description, success_criteria, now, now),
+        )
+        conn.commit()
+        gid = cur.lastrowid
+    return (
+        f"已创建目标 #{gid}\n"
+        f"描述：{description}\n"
+        f"达成标准：{success_criteria}\n"
+        f"状态：pending\n"
+        f"下一步：调 advance_goal 记录第一次推进"
+    )
+
+
+def advance_goal(goal_id: int, action: str, result: str, next_step: str) -> str:
+    """推进目标。记录本次 action/result，写下 next_step 给未来的自己。\n    next_step 是关键——下次对话 agent 能接上。状态自动流转：pending → in_progress → on_track。"""
+    uid = _CURRENT_USER
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT status, progress_log FROM goals WHERE id = ? AND user_id = ?",
+            (goal_id, uid),
+        ).fetchone()
+        if not row:
+            return f"找不到目标 #{goal_id}"
+        log = json.loads(row["progress_log"] or "[]")
+        log.append({
+            "ts": now,
+            "action": action,
+            "result": result,
+            "next_step": next_step,
+        })
+        # 状态自动流转：首次推进 pending→in_progress，第二次开始 in_progress→on_track
+        new_status = row["status"]
+        if new_status == "pending":
+            new_status = "in_progress"
+        elif new_status == "in_progress":
+            new_status = "on_track"
+        conn.execute(
+            "UPDATE goals SET progress_log = ?, status = ?, updated_at = ? "
+            "WHERE id = ? AND user_id = ?",
+            (json.dumps(log, ensure_ascii=False), new_status, now, goal_id, uid),
+        )
+        conn.commit()
+    return (
+        f"目标 #{goal_id} 推进已记录\n"
+        f"本次行动：{action}\n"
+        f"本次结果：{result}\n"
+        f"状态：{new_status}\n"
+        f"下次该干：{next_step}"
+    )
+
+
+def get_goal(goal_id: int | None = None) -> str:
+    """查目标。不传 id 返回所有进行中（pending/in_progress/on_track）的目标；
+    传 id 返回单个目标详情含完整进度日志。按 user_id 隔离。"""
+    uid = _CURRENT_USER
+    with closing(_connect()) as conn:
+        if goal_id is None:
+            rows = conn.execute(
+                "SELECT id, description, status, success_criteria FROM goals "
+                "WHERE user_id = ? AND status IN ('pending','in_progress','on_track') "
+                "ORDER BY updated_at DESC",
+                (uid,),
+            ).fetchall()
+            if not rows:
+                return "当前没有进行中的长期目标。"
+            lines = ["【进行中的长期目标】"]
+            for r in rows:
+                lines.append(
+                    f"#{r['id']} [{r['status']}] {r['description']}\n"
+                    f"  达成标准：{r['success_criteria']}"
+                )
+            return "\n".join(lines)
+        row = conn.execute(
+            "SELECT id, description, success_criteria, status, progress_log, "
+            "created_at, updated_at FROM goals WHERE id = ? AND user_id = ?",
+            (goal_id, uid),
+        ).fetchone()
+        if not row:
+            return f"找不到目标 #{goal_id}"
+        log = json.loads(row["progress_log"] or "[]")
+        lines = [
+            f"目标 #{row['id']}",
+            f"描述：{row['description']}",
+            f"达成标准：{row['success_criteria']}",
+            f"状态：{row['status']}",
+            f"创建于：{row['created_at']}，更新于：{row['updated_at']}",
+            f"进度日志（共 {len(log)} 条）：",
+        ]
+        for i, e in enumerate(log, 1):
+            lines.append(
+                f"  {i}. [{e['ts']}] {e['action']} → {e['result'][:40]}...\n"
+                f"     下次：{e['next_step']}"
+            )
+        return "\n".join(lines)
+
+
+def update_goal_status(goal_id: int, status: str, reason: str = "") -> str:
+    """显式状态流转：done（完成）/ blocked（卡住）/ abandoned（放弃）。
+    pending/in_progress/on_track 状态由 advance_goal 自动管理，不在此处理。
+    """
+    if status not in ("done", "blocked", "abandoned"):
+        return "错误：status 必须是 done/blocked/abandoned"
+    uid = _CURRENT_USER
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT status FROM goals WHERE id = ? AND user_id = ?",
+            (goal_id, uid),
+        ).fetchone()
+        if not row:
+            return f"找不到目标 #{goal_id}"
+        conn.execute(
+            "UPDATE goals SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+            (status, now, goal_id, uid),
+        )
+        conn.commit()
+    extra = f"（原因：{reason}）" if reason else ""
+    return f"目标 #{goal_id} 状态已更新为 {status}{extra}"
+
+
+def get_goal_next_steps() -> list[dict]:
+    """自驱循环专用：取所有进行中目标各自的最新 next_step。
+
+    和 get_goal 的分工：get_goal 返回格式化字符串给模型看；
+    这个返回结构化数据，给 orchestrator 的自驱触发器拼触发消息用。
+    """
+    uid = _CURRENT_USER
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT id, text, done, created_at FROM todos ORDER BY done, id"
+            "SELECT id, description, status, success_criteria, progress_log FROM goals "
+            "WHERE user_id = ? AND status IN ('pending','in_progress','on_track') "
+            "ORDER BY updated_at ASC",
+            (uid,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        log = json.loads(r["progress_log"] or "[]")
+        next_step = log[-1]["next_step"] if log else "（尚无进度记录，先做初始推进）"
+        out.append({
+            "goal_id": r["id"],
+            "description": r["description"],
+            "status": r["status"],
+            "success_criteria": r["success_criteria"],
+            "next_step": next_step,
+        })
+    return out
+
+
+def list_todos(session_id: str | None = None) -> str:
+    """列出所有待办，未完成在前。session_id 语义同 add_todos。"""
+    sid = session_id or _CURRENT_SESSION
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            "SELECT id, text, done, created_at FROM todos "
+            "WHERE session_id = ? ORDER BY done, id",
+            (sid,),
         ).fetchall()
 
     if not rows:
@@ -252,6 +599,79 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8-sig", errors="ignore")
     except UnicodeDecodeError:
         return path.read_text(encoding="gbk", errors="ignore")
+
+
+# 格式转换层：把各种文件格式统一转成纯文本，喂给下游的 RAG 索引和摘要。
+def _extract_text(path: Path) -> str:
+    """按文件后缀分派解析器，统一返回纯文本。"""
+    suffix = path.suffix.lower()
+    if suffix in {".md", ".txt"}:
+        return _read_text(path)
+    if suffix == ".csv":
+        return _extract_csv(path)
+    if suffix == ".xlsx":
+        return _extract_excel(path)
+    if suffix == ".pdf":
+        return _extract_pdf(path)
+    if suffix == ".docx":
+        return _extract_docx(path)
+    return _read_text(path)  # 兜底，理论上 SUPPORTED_SUFFIX 已过滤
+
+
+def _df_to_markdown(df) -> str:
+    """把 pandas DataFrame 转成 Markdown 表格字符串。"""
+    if df.empty:
+        return ""
+    # NaN 转空串，避免表格里出现 nan
+    df = df.fillna("")
+    headers = [str(c) for c in df.columns]
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join("---" for _ in headers) + " |"]
+    for _, row in df.iterrows():
+        lines.append("| " + " | ".join(str(v) for v in row) + " |")
+    return "\n".join(lines)
+
+
+def _extract_csv(path: Path) -> str:
+    """CSV 转 Markdown 表格。自动尝试 utf-8 / gbk 编码。"""
+    import pandas as pd
+    for enc in ("utf-8-sig", "gbk"):
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            return _df_to_markdown(df)
+        except UnicodeDecodeError:
+            continue
+    return _df_to_markdown(pd.read_csv(path, encoding="utf-8", errors="ignore"))
+
+
+def _extract_excel(path: Path) -> str:
+    """Excel 多 sheet 转 Markdown 表格，每个 sheet 带标题。"""
+    import pandas as pd
+    sheets = pd.read_excel(path, sheet_name=None)
+    parts = []
+    for sheet_name, df in sheets.items():
+        table = _df_to_markdown(df)
+        if table:
+            parts.append(f"## Sheet: {sheet_name}\n\n{table}")
+    return "\n\n".join(parts)
+
+
+def _extract_pdf(path: Path) -> str:
+    """PDF 提取文本（逐页拼接，页间用分页标记分隔）。"""
+    import pdfplumber
+    pages = []
+    with pdfplumber.open(path) as pdf:
+        for i, page in enumerate(pdf.pages, 1):
+            text = page.extract_text() or ""
+            if text.strip():
+                pages.append(f"--- 第 {i} 页 ---\n{text}")
+    return "\n\n".join(pages)
+
+
+def _extract_docx(path: Path) -> str:
+    """Word 提取正文段落文本。"""
+    from docx import Document
+    doc = Document(path)
+    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 #列出文档
 def list_documents() -> str:
     """列出 documents/ 下可读取的文档及字数。"""
@@ -260,11 +680,11 @@ def list_documents() -> str:
         p for p in DOCS_DIR.iterdir() if p.suffix.lower() in SUPPORTED_SUFFIX
     )
     if not files:
-        return "documents/ 目录下还没有可读取的文档（目前只支持 .md 和 .txt）。"
+        return "documents/ 目录下还没有可读取的文档（支持 .md .txt .csv .xlsx .pdf .docx）。"
 
     lines = []
     for p in files:
-        size = len(_read_text(p))
+        size = len(_extract_text(p))
         hint = "可直接读全文" if size <= FULL_TEXT_LIMIT else "较长，会自动分块摘要"
         lines.append(f"- {p.name}（{size} 字，{hint}）")
     return "可用文档：\n" + "\n".join(lines)
@@ -377,11 +797,11 @@ def read_document(filename: str) -> str:
     """读取文档内容。短文档返回全文；长文档先截断（第 2 步改成分块摘要）。"""
     path = _doc_path(filename)
     if path.suffix.lower() not in SUPPORTED_SUFFIX:
-        return f"暂不支持 {path.suffix} 文件，目前只支持 .md 和 .txt。"
+        return f"暂不支持 {path.suffix} 文件，目前支持 .md .txt .csv .xlsx .pdf .docx。"
     if not path.exists():
         return f"没有找到「{filename}」。\n{list_documents()}"
 
-    text = _read_text(path)
+    text = _extract_text(path)
     if not text.strip():
         return f"文档「{path.name}」是空的。"
     if len(text) > FULL_TEXT_LIMIT:
@@ -454,244 +874,84 @@ def _tokenize(text: str) -> list[str]:
     return tokens
 
 
-def _kb_chunks(text: str) -> list[str]:
-    """按字符滑窗切块，块间保留重叠，避免把关键句切断。"""
-    step = KB_CHUNK_SIZE - KB_CHUNK_OVERLAP
-    chunks: list[str] = []
-    for i in range(0, len(text), step):
-        piece = text[i : i + KB_CHUNK_SIZE].strip()
-        if piece:
-            chunks.append(piece)
-        if i + KB_CHUNK_SIZE >= len(text):
-            break
-    return chunks
-
-
-def _drop_doc(conn: sqlite3.Connection, name: str) -> None:
-    """清掉某文档的索引（重建前 / 文件已删除时）。"""
-    ids = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_name=?", (name,))]
-    if not ids:
-        return
-    conn.execute(f"DELETE FROM terms WHERE chunk_id IN ({','.join('?' * len(ids))})", ids)
-    conn.execute("DELETE FROM chunks WHERE doc_name=?", (name,))
-
-
-def _index_doc(conn: sqlite3.Connection, name: str, text: str, mtime: float) -> int:
-    """重建单个文档的索引：先删旧，再插新，最后补向量。"""
-    _drop_doc(conn, name)
-    chunks = _kb_chunks(text)
-    ids: list[int] = []
-
-    for idx, chunk in enumerate(chunks):
-        cur = conn.execute(
-            "INSERT INTO chunks (doc_name, chunk_idx, text, mtime) VALUES (?,?,?,?)",
-            (name, idx, chunk, mtime),
-        )
-        cid = cur.lastrowid
-        if cid is None:  # 插入未返回 rowid，跳过，避免后面拿到 None
-            continue
-        ids.append(cid)
-        counts: dict[str, int] = {}
-        for t in _tokenize(chunk):
-            counts[t] = counts.get(t, 0) + 1
-        conn.executemany(
-            "INSERT OR REPLACE INTO terms (term, chunk_id, tf) VALUES (?,?,?)",
-            [(t, cid, c) for t, c in counts.items()],
-        )
-
-    vecs = _embed(chunks)
-    if vecs and len(vecs) == len(ids):
-        conn.executemany(
-            "UPDATE chunks SET vec=? WHERE id=?",
-            [(_pack_vec(v), cid) for v, cid in zip(vecs, ids)],
-        )
-    return len(ids)
-
-
-
-def _ensure_index(conn: sqlite3.Connection) -> None:
-    """让索引跟磁盘保持一致：改动过的重建，已删除的清掉。靠 mtime 判断。"""
-    DOCS_DIR.mkdir(parents=True, exist_ok=True)
-    on_disk = {
-        p.name: p.stat().st_mtime
-        for p in DOCS_DIR.iterdir()
-        if p.suffix.lower() in SUPPORTED_SUFFIX
-    }
-    indexed = {
-        r["doc_name"]: r["mtime"]
-        for r in conn.execute(
-            "SELECT doc_name, MAX(mtime) AS mtime FROM chunks GROUP BY doc_name"
-        )
-    }
-
-    for name in set(indexed) - set(on_disk):
-        _drop_doc(conn, name)
-
-    for name, mtime in on_disk.items():
-        if indexed.get(name) != mtime:
-            _index_doc(conn, name, _read_text(DOCS_DIR / name), mtime)
-        # 老索引（加 vec 列之前建的）没有向量，补齐；embedding 不可用时 _embed 返回 None，直接跳过
-    todo = conn.execute("SELECT id, text FROM chunks WHERE vec IS NULL").fetchall()
-    if todo:
-        vecs = _embed([r["text"] for r in todo])
-        if vecs and len(vecs) == len(todo):
-            conn.executemany(
-                "UPDATE chunks SET vec=? WHERE id=?",
-                [(_pack_vec(v), r["id"]) for v, r in zip(vecs, todo)],
-            )
-
-    conn.commit()
-
-def _bm25_scores(conn: sqlite3.Connection, qterms: list[str]) -> dict[int, float]:
-    """BM25 打分。-- 原 search_knowledge 里的打分逻辑，抽出来好跟向量路平级。"""
-    if not qterms:
-        return {}
-    ph = ",".join("?" * len(qterms))
-    total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    df = {
-        r[0]: r[1]
-        for r in conn.execute(
-            f"SELECT term, COUNT(*) FROM terms WHERE term IN ({ph}) GROUP BY term",
-            qterms,
-        )
-    }
-    avgdl = conn.execute("SELECT AVG(LENGTH(text)) FROM chunks").fetchone()[0] or 1.0
-    rows = conn.execute(
-        f"""
-        SELECT c.id, t.term, t.tf, LENGTH(c.text) AS dl
-        FROM terms t JOIN chunks c ON c.id = t.chunk_id
-        WHERE t.term IN ({ph})
-        """,
-        qterms,
-    ).fetchall()
-
-    k1, b = 1.5, 0.75
-    scores: dict[int, float] = {}
-    for r in rows:
-        d = df.get(r["term"], 0)
-        idf = math.log(1 + (total - d + 0.5) / (d + 0.5)) if d else 0.0
-        tf, dl = r["tf"], r["dl"] or 1
-        scores[r["id"]] = scores.get(r["id"], 0.0) + idf * (tf * (k1 + 1)) / (
-            tf + k1 * (1 - b + b * dl / avgdl)
-        )
-    return scores
-
-
-def _vec_scores(conn: sqlite3.Connection, query: str) -> dict[int, float]:
-    """向量路：query 整句向量化，与所有 chunk 算余弦。不做分词 —— 这正是它的优势。"""
-    rows = conn.execute("SELECT id, vec FROM chunks WHERE vec IS NOT NULL").fetchall()
-    if not rows:
-        return {}
-    q = _embed([query])
-    if not q:
-        return {}
-    qv = q[0]
-    return {
-        r["id"]: s
-        for r in rows
-        if (s := _cosine(qv, _unpack_vec(r["vec"]))) >= VEC_MIN_SCORE
-    }
-
-
-def _rrf(pools: list[dict[int, float]], k: int = RRF_K) -> dict[int, float]:
-    """RRF 融合：只看名次不看分数，绕开两路量纲不可比的问题。"""
-    fused: dict[int, float] = {}
-    for scores in pools:
-        for rank, cid in enumerate(sorted(scores, key=lambda c: -scores[c]), 1):
-            fused[cid] = fused.get(cid, 0.0) + 1.0 / (k + rank)
-    return fused
-
-def search_knowledge(query: str, top_k: int = KB_TOP_K, mode: str = "hybrid") -> str:
-    """在个人知识库里检索：关键词(BM25) + 语义(embedding)，RRF 融合取 Top-K。
-
-    mode: hybrid(默认，两路融合) / keyword(纯关键词) / semantic(纯语义)。
-    """
-    top_k = max(1, min(int(top_k), 10))
-    mode = (mode or "hybrid").lower()
-    if mode not in {"hybrid", "keyword", "semantic"}:
-        mode = "hybrid"
-
-    with closing(_connect()) as conn:
-        _ensure_index(conn)
-
-        total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        if total == 0:
-            return "知识库是空的：documents/ 目录下还没有可索引的 .md / .txt 文档。"
-
-        meta = {
-            r["id"]: (r["doc_name"], r["text"])
-            for r in conn.execute("SELECT id, doc_name, text FROM chunks")
-        }
-        qterms = sorted(set(_tokenize(query)))
-
-        bm25 = {} if mode == "semantic" else _bm25_scores(conn, qterms)
-        vec = {} if mode == "keyword" else _vec_scores(conn, query)
-
-        if mode == "keyword":
-            fused = bm25
-        elif mode == "semantic":
-            fused = vec
-        else:
-            # 某一路候选太少 = 它对这个查询基本失效，它的"第 1 名"含金量很低，
-            # 参与融合只会污染结果（RRF 会给它 1/(k+1) 的最高档分数）。
-            pools = [p for p in (bm25, vec) if len(p) >= KB_MIN_POOL]
-            fused = _rrf(pools) if len(pools) > 1 else (bm25 or vec)
-
-        with closing(_connect()) as conn:
-            n_vec = conn.execute(
-                "SELECT COUNT(*) FROM chunks WHERE vec IS NOT NULL"
-            ).fetchone()[0]
-        print(
-            f"  [检索] 模式={mode}｜关键词命中 {len(bm25)} 条，语义候选 {len(vec)} 条"
-            f"｜知识库 {len(meta)} 块，其中 {n_vec} 块已向量化"
-        )
-
-
-    if not fused:
-        return (
-            f"没有找到与「{query}」相关的文档内容。"
-            f"可以换个更贴近文档用词的说法再试，或调用 list_documents 确认有哪些文档。"
-        )
-
-    ranked = sorted(fused.items(), key=lambda x: -x[1])[:top_k]
-    blocks = []
-    for i, (cid, s) in enumerate(ranked, 1):
-        doc, text = meta[cid]
-        hits = "+".join(
-            t for t, pool in (("关键词", bm25), ("语义", vec)) if cid in pool
-        ) or "无"
-        blocks.append(
-            f"[{i}] 来自《{doc}》｜融合分 {s:.4f}｜命中：{hits}\n{text}"
-        )
-
-    return (
-        f"共 {len(fused)} 个候选片段，以下是最相关的 {len(ranked)} 条：\n\n"
-        + "\n\n".join(blocks)
-        + "\n\n（以上是知识库中的原文片段，是回答的唯一依据。"
-        "片段里没有的信息，请如实说明文档中未提到，不要用自己的知识补充。）"
-    )
-
 # ---------- 长期记忆 ----------
 
 
 def list_memories() -> str:
-    """返回全部记忆，用于注入系统提示词。不给模型调用，所以不注册进 TOOLS。"""
+    """返回当前有效的全部记忆，用于注入系统提示词。不给模型调用，所以不注册进 TOOLS。
+
+    valid_to IS NULL = 还没被新值替代 = 当前真相。
+    被归档的旧值物理上还在表里，但这里不返回，免得模型看到两条矛盾的记忆。
+    """
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT id, content FROM memories ORDER BY id"
+            "SELECT id, content FROM memories WHERE valid_to IS NULL AND user_id = ? ORDER BY id",
+            (_CURRENT_USER,),
         ).fetchall()
 
     if not rows:
         return "（暂无记忆）"
     return "\n".join(f"- #{r['id']} {r['content']}" for r in rows)
 
+def _row_vec(conn: sqlite3.Connection, r: sqlite3.Row) -> Sequence[float] | None:
+    """取一条记忆的存量向量；老记忆没有（列是后加的）就现场补算并回写，老数据逐渐自愈。"""
+    if r["vec"] is not None:
+        return _unpack_vec(r["vec"])
+    vecs = _embed([r["content"]])
+    if not vecs:
+        return None
+    conn.execute("UPDATE memories SET vec = ? WHERE id = ?", (_pack_vec(vecs[0]), r["id"]))
+    return vecs[0]
+
+def _archive_memory(
+    conn: sqlite3.Connection, old: sqlite3.Row, content: str, now: str, new_vec: Sequence[float] | None
+) -> str:
+    """归档旧记忆并插入新值：旧值不删，只标失效 + 记下被谁替代。"""
+    cur = conn.execute(
+        "INSERT INTO memories (user_id, content, created_at, updated_at, vec) VALUES (?, ?, ?, ?, ?)",
+        (_CURRENT_USER, content, now, now, _pack_vec(new_vec) if new_vec else None),
+    )
+    new_id = cur.lastrowid
+    conn.execute(
+        "UPDATE memories SET valid_to = ?, superseded_by = ? WHERE id = ?",
+        (now, new_id, old["id"]),
+    )
+    conn.commit()
+    return f"已更新记忆 #{old['id']} → #{new_id}：{old['content']} → {content}（旧值已归档，可查历史）"
+
+def _judge_memory_conflict(new_content: str, candidates: list[sqlite3.Row]) -> list[int]:
+    """让 LLM 判定新事实与哪些旧记忆是同一属性的新值。返回应归档的旧记忆 id；失败返回 []。"""
+    lines = "\n".join(f"- id={r['id']}: {r['content']}" for r in candidates)
+    prompt = (
+        "下面是一条新事实和若干条同一用户的旧事实。\n"
+        "判断新事实是否是某条旧事实中同一属性的新值（例如城市变了、职位变了）。\n"
+        "只做事实比对：同一属性的新值才算冲突；话题相近但属性不同不算冲突。\n"
+        f"旧事实：\n{lines}\n"
+        f"新事实：{new_content}\n"
+        "只输出 JSON 数组，形如 [3]，元素是发生冲突的旧事实 id；没有冲突输出 []。不要输出其他内容。"
+    )
+    try:
+        resp = _llm().chat.completions.create(
+            model=os.environ["OPENAI_MODEL"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
+        return [int(i) for i in json.loads(raw)]
+    except Exception:
+        return []
 
 def remember(content: str) -> str:
     """记住一条关于用户的长期事实或偏好，跨会话保留。
 
+    冲突消解：相似度高的旧记忆不直接覆盖 content，而是归档
+    （写 valid_to + superseded_by），新值作为新行插入。
+    这样既能查"曾经"，又不会让矛盾的两条在当前记忆里并存。
+
     只记长期稳定的信息：身份、职业、所在地、习惯、偏好、长期项目背景。
-    不要记：一次性任务（如"查天气"）、documents 里能检索到的事实、
-    敏感凭证（密码、卡号、证件号）、你的推测。
+    不要记：一次性任务、documents 里能检索到的事实、
+    敏感凭证、你的推测。
     """
     content = content.strip()
     if not content:
@@ -701,38 +961,54 @@ def remember(content: str) -> str:
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     key = _norm(content)
+    # 新内容向量一次算好；embedding 熔断时为 None，语义路自动跳过，退回纯字面行为
+    vecs = _embed([content])
+    new_vec = vecs[0] if vecs else None
 
     with closing(_connect()) as conn:
-        rows = conn.execute("SELECT id, content FROM memories").fetchall()
+        # 只在"当前用户的有效记忆"里查重，别把别的用户或已归档的旧值翻出来比
+        rows = conn.execute(
+            "SELECT id, content, vec FROM memories WHERE valid_to IS NULL AND user_id = ?",
+            (_CURRENT_USER,),
+        ).fetchall()
 
-        # 完全一样：直接跳过
+        # 完全一样：跳过
         for r in rows:
             if _norm(r["content"]) == key:
                 return f"这条已经记过了（#{r['id']}）：{r['content']}"
 
-        # 高度相似 = 同一件事的新说法，更新旧的，绝不并存两条矛盾的
+        # 双路打分：字面 ratio + 语义余弦，先收集再决策
+        scored = []
         for r in rows:
             ratio = difflib.SequenceMatcher(None, key, _norm(r["content"])).ratio()
-            if ratio >= MEM_SIM_THRESHOLD:
-                conn.execute(
-                    "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
-                    (content, now, r["id"]),
-                )
-                conn.commit()
-                return f"已更新记忆 #{r['id']}：{r['content']} → {content}"
+            old_vec = _row_vec(conn, r)
+            sim = _cosine(new_vec, old_vec) if new_vec and old_vec else 0.0
+            scored.append((ratio, sim, r))
+
+        # 高置信：字面或语义任一路直接超阈值，归档，不惊动 LLM
+        for ratio, sim, r in scored:
+            if ratio >= MEM_SIM_THRESHOLD or sim >= MEM_VEC_THRESHOLD:
+                return _archive_memory(conn, r, content, now, new_vec)
+
+        # 中置信：相似度只衡量"像不像"，衡量不了"冲不冲突"——判定权交给 LLM
+        cands = [r for ratio, sim, r in scored if sim >= MEM_VEC_RECALL]
+        if cands:
+            hit_ids = _judge_memory_conflict(content, cands)
+            for r in cands:
+                if r["id"] in hit_ids:
+                    return _archive_memory(conn, r, content, now, new_vec)
 
         if len(rows) >= MEM_MAX:
             return f"记忆已满（{MEM_MAX} 条），请先调用 forget 清理。"
 
         cur = conn.execute(
-            "INSERT INTO memories (content, created_at, updated_at) VALUES (?, ?, ?)",
-            (content, now, now),
+            "INSERT INTO memories (user_id, content, created_at, updated_at, vec) VALUES (?, ?, ?, ?, ?)",
+            (_CURRENT_USER, content, now, now, _pack_vec(new_vec) if new_vec else None),
         )
-        conn.commit()
         new_id = cur.lastrowid
+        conn.commit()
 
     return f"已记住 #{new_id}：{content}"
-
 
 def forget(content: str) -> str:
     """删除记忆。content 可以是原话，也可以是其中的关键词。"""
@@ -741,7 +1017,10 @@ def forget(content: str) -> str:
         return "请说明要删除哪条记忆。"
 
     with closing(_connect()) as conn:
-        rows = conn.execute("SELECT id, content FROM memories").fetchall()
+        rows = conn.execute(
+            "SELECT id, content FROM memories WHERE user_id = ?",
+            (_CURRENT_USER,),
+        ).fetchall()
         # 先精确包含，再模糊相似
         hit = [r for r in rows if key in _norm(r["content"])]
         if not hit:
@@ -754,10 +1033,142 @@ def forget(content: str) -> str:
             return f"没有找到与「{content}」相关的记忆（当前共 {len(rows)} 条）。"
 
         for r in hit:
-            conn.execute("DELETE FROM memories WHERE id = ?", (r["id"],))
+            conn.execute(
+                "DELETE FROM memories WHERE id = ? AND user_id = ?",
+                (r["id"], _CURRENT_USER),
+            )
         conn.commit()
 
     return "已删除记忆：\n" + "\n".join(f"- #{r['id']} {r['content']}" for r in hit)
+# ---------- 对话历史 ----------
+
+def save_message(session_id: str, payload: dict[str, Any]) -> None:
+    """存一条消息。payload 是完整 message dict，JSON 原样进出，零信息损失。"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with closing(_connect()) as conn:
+        conn.execute(
+            "INSERT INTO messages (session_id, role, payload, created_at) VALUES (?,?,?,?)",
+            (
+                session_id,
+                payload.get("role", "unknown"),
+                json.dumps(payload, ensure_ascii=False),
+                now,
+            ),
+        )
+        conn.commit()
+
+
+def load_recent_messages(session_id: str, limit: int) -> list[dict[str, Any]]:
+    """取最近 limit 条，按时间正序返回，方便直接 append 进上下文。"""
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            "SELECT payload FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+    return [json.loads(r["payload"]) for r in reversed(rows)]
+
+def clear_messages(session_id: str) -> None:
+    """只清空消息，保留摘要。压缩时用这个 —— 摘要是压缩的产物，不能一起删。"""
+    with closing(_connect()) as conn:
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.commit()
+def archive_messages(session_id: str, messages: list[dict[str, Any]]) -> None:
+    """把被压缩掉的消息归档到 archived_messages，并建索引供后续检索式召回。
+
+    索引两路：BM25（terms_archived 表）+ 向量（vec 列），和知识库检索同一套架构。
+    只给 user / assistant 消息建索引，tool 消息（工具返回）跳过——内容太长太杂。
+    embedding 失败时自动降级为纯 BM25（沿用 _embed 的熔断机制）。
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with closing(_connect()) as conn:
+        for m in messages:
+            role = m.get("role", "unknown")
+            # 跳过 system 和 tool 消息，只索引用户/助手的对话内容
+            if role not in ("user", "assistant"):
+                continue
+            content = m.get("content") or ""
+            if not content.strip():
+                continue
+
+            cur = conn.execute(
+                "INSERT INTO archived_messages (session_id, role, payload, text, created_at, archived_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    session_id,
+                    role,
+                    json.dumps(m, ensure_ascii=False),
+                    content,
+                    m.get("created_at", ""),
+                    now,
+                ),
+            )
+            msg_id = cur.lastrowid
+            if msg_id is None:
+                continue
+
+            # BM25 分词索引
+            counts: dict[str, int] = {}
+            for t in _tokenize(content):
+                counts[t] = counts.get(t, 0) + 1
+            conn.executemany(
+                "INSERT OR REPLACE INTO terms_archived (term, msg_id, tf) VALUES (?,?,?)",
+                [(t, msg_id, c) for t, c in counts.items()],
+            )
+
+            # 向量索引（失败就降级，不阻塞）
+            vecs = _embed([content])
+            if vecs and len(vecs) == 1:
+                conn.execute(
+                    "UPDATE archived_messages SET vec = ? WHERE id = ?",
+                    (_pack_vec(vecs[0]), msg_id),
+                )
+        conn.commit()
+def clear_session(session_id: str) -> None:
+    """清空某个会话的历史与摘要。"""
+    with closing(_connect()) as conn:
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM archived_messages WHERE session_id = ?", (session_id,))
+        conn.commit()
+
+def clear_user(user_id: str) -> None:
+    """清空某个用户的全部记忆（待办按会话隔离，不归这里管）。"""
+    with closing(_connect()) as conn:
+        conn.execute("DELETE FROM memories WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def get_summary(session_id: str) -> tuple[str, str]:
+    """返回 (细摘要, 粗摘要)。细摘要=近期对话要点，粗摘要=跨多轮的核心事实。"""
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT fine_summary, coarse_summary FROM summaries WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    if not row:
+        return "", ""
+    return row["fine_summary"] or "", row["coarse_summary"] or ""
+
+
+def save_summary(session_id: str, fine: str, coarse: str = "") -> None:
+    """保存两层摘要。fine=细摘要(近期)，coarse=粗摘要(长期核心事实)。
+
+    注意：旧的 summary 列仍在表里且有 NOT NULL 约束，这里顺手塞个空串占位，
+    新代码不再读写它。
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with closing(_connect()) as conn:
+        conn.execute(
+            "INSERT INTO summaries (session_id, fine_summary, coarse_summary, summary, updated_at) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "fine_summary = excluded.fine_summary, "
+            "coarse_summary = excluded.coarse_summary, "
+            "summary = '', "
+            "updated_at = excluded.updated_at",
+            (session_id, fine, coarse, "", now),
+        )
+        conn.commit()
 
 # 工具的「说明书」：模型靠它决定要不要用、怎么用
 TOOLS: list[ChatCompletionToolParam] = [
@@ -986,9 +1397,132 @@ TOOLS: list[ChatCompletionToolParam] = [
             },
         },
     },
-
+    {
+        "type": "function",
+        "function": {
+            "name": "retrieve_history",
+            "description": (
+                "在你之前的聊天历史中检索相关内容。"
+                "**当用户问到「我们之前聊过什么」「刚才那个 XX 是多少」"
+                "「你还记得我之前说的 XX 吗」，或任何引用了早期对话但"
+                "当前上下文里已找不到的内容时，必须先调用本工具。**"
+                "不要凭对话记忆回答——早期对话已被压缩，只有检索回来才是真实内容。"
+                "与 search_knowledge 的区别：search_knowledge 查 documents 知识库，"
+                "本工具查你和用户的聊天历史。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "检索关键词，保留核心名词，例如「杭州 工作 预算」",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返回几条，默认 5，最多 10",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_goal",
+            "description": (
+                "创建一个长期目标。"
+                "当用户说出长期成果类请求（不是单步动作），例如「我想这周读完 X」「我要减抖10斤」时调。\n"
+                "与 add_todos 区别：add_todos 是单步动作，create_goal 是跨多次对话推进的成果。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "目标描述，例如：这周读完《活着》",
+                    },
+                    "success_criteria": {
+                        "type": "string",
+                        "description": "可验证的达成标准，例如：读完最后一页并给感想",
+                    },
+                },
+                "required": ["description", "success_criteria"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "advance_goal",
+            "description": (
+                "推进目标。每次对话开头/结尾调一次。\n"
+                "next_step 是关键——写下下次该干啥，让未来的自己接得上。\n"
+                "状态自动从 pending→in_progress→on_track 流转。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "integer", "description": "目标 id"},
+                    "action": {"type": "string", "description": "本次做了什么"},
+                    "result": {"type": "string", "description": "本次拿到什么结果"},
+                    "next_step": {"type": "string", "description": "下次对话该干啥"},
+                },
+                "required": ["goal_id", "action", "result", "next_step"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_goal",
+            "description": (
+                "查长期目标。不传 goal_id 返回所有进行中目标；传 id 返回单个详情含进度日志。\n"
+                "本工具是只读的，可并发。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {
+                        "type": "integer",
+                        "description": "目标 id。不传返回全部进行中目标。",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_goal_status",
+            "description": (
+                "显式状态流转：done（完成）/ blocked（卡住）/ abandoned（放弃）。\n"
+                "pending/in_progress/on_track 由 advance_goal 自动管理，不在此处理。\n"
+                "只有达成了 success_criteria 或确实卡住才调。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "integer", "description": "目标 id"},
+                    "status": {"type": "string", "enum": ["done", "blocked", "abandoned"]},
+                    "reason": {"type": "string", "description": "状态变更原因，可选"},
+                },
+                "required": ["goal_id", "status"],
+            },
+        },
+    },
 ]
 
+
+# search_knowledge 定义在 rag.py。用懒加载包装，避免 tools ↔ rag 循环导入：
+# 只有真正调用时才 import rag，无论 tools 和 rag 谁先被 import 都能工作。
+def _search_knowledge_lazy(*args: Any, **kwargs: Any) -> str:
+    from rag import search_knowledge
+    return search_knowledge(*args, **kwargs)
+def _retrieve_history_lazy(*args: Any, **kwargs: Any) -> str:
+    from rag import retrieve_history
+    return retrieve_history(*args, **kwargs)
 
 # 名字 → 真实函数。调度时用它查表执行。
 TOOL_FUNCTIONS: dict[str, Callable[..., str]] = {
@@ -999,14 +1533,19 @@ TOOL_FUNCTIONS: dict[str, Callable[..., str]] = {
     "read_document": read_document,
     "complete_todo": complete_todo,
     "delete_todo": delete_todo,
-    "search_knowledge": search_knowledge,
+    "search_knowledge": _search_knowledge_lazy,
     "remember": remember,
+    "create_goal": create_goal,
+    "advance_goal": advance_goal,
+    "get_goal": get_goal,
+    "update_goal_status": update_goal_status,
     "forget": forget,
+    "retrieve_history": _retrieve_history_lazy,
 }
 # 可以并发执行的工具：只读或纯网络 I/O，彼此无状态冲突。
 # 写数据库的工具串行执行，避免 sqlite 锁竞争。
 READ_ONLY_TOOLS = frozenset(
-    {"get_weather", "list_todos", "list_documents", "read_document", "search_knowledge"}
+    {"get_weather", "list_todos", "list_documents", "read_document", "search_knowledge","retrieve_history", "get_goal"}
 )
 
 

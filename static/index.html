@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Agent · 手搓智能体</title>
+<style>
+  /* —— 纸墨编辑风：暖纸底 + 墨色字 + 青墨强调，中文用宋/黑系统字栈，零网络依赖 —— */
+  :root {
+    --paper: #f5f1e8;
+    --card: #fffdf7;
+    --ink: #26231c;
+    --ink-soft: #6b6557;
+    --line: #e3dccb;
+    --accent: #2f6f5e;
+    --accent-ink: #ffffff;
+    --tool-bg: #edf1e8;
+    --tool-line: #cfdac6;
+    --warn-bg: #fdf2dd;
+    --warn-line: #e6c382;
+    --warn-ink: #7a5410;
+    --err-bg: #fcebe8;
+    --err-line: #e0a39a;
+    --err-ink: #8f2d20;
+    --mono: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+    --hei: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    --song: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "STSong", SimSun, serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: var(--hei);
+    background: var(--paper);
+    color: var(--ink);
+    font-size: 16px;
+    line-height: 1.7;
+    display: flex; flex-direction: column;
+  }
+
+  /* —— 顶栏 —— */
+  header {
+    flex: 0 0 auto;
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 24px;
+    background: var(--card);
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 {
+    font-family: var(--song);
+    font-size: 20px; font-weight: 700; letter-spacing: 1px;
+    white-space: nowrap;
+  }
+  header h1 small { font-size: 12px; color: var(--ink-soft); font-weight: 400; margin-left: 8px; }
+  .spacer { flex: 1; }
+  .session-box { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--ink-soft); }
+  .session-box input {
+    width: 130px; padding: 6px 10px;
+    border: 1px solid var(--line); border-radius: 8px;
+    background: var(--paper); color: var(--ink);
+    font-family: var(--mono); font-size: 13px;
+  }
+  .session-box input:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
+  .trace-link {
+    font-size: 14px; color: var(--accent); text-decoration: none;
+    border: 1px solid var(--tool-line); border-radius: 8px; padding: 6px 12px;
+    background: var(--tool-bg); white-space: nowrap;
+  }
+  .trace-link:hover { filter: brightness(0.97); }
+
+  /* —— 消息流 —— */
+  main {
+    flex: 1 1 auto; overflow-y: auto;
+    padding: 28px 20px 40px;
+  }
+  .feed { max-width: 780px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+  .empty-tip {
+    text-align: center; color: var(--ink-soft); font-family: var(--song);
+    font-size: 15px; margin-top: 12vh; line-height: 2.2;
+  }
+
+  .msg { display: flex; flex-direction: column; animation: rise .28s ease both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .msg .who {
+    font-size: 13px; color: var(--ink-soft); margin-bottom: 6px;
+    font-family: var(--mono); letter-spacing: .5px;
+  }
+  .bubble {
+    padding: 13px 17px; border-radius: 4px 14px 14px 14px;
+    max-width: 92%; white-space: pre-wrap; word-break: break-word;
+  }
+  .msg.user { align-items: flex-end; }
+  .msg.user .who { display: none; }
+  .msg.user .bubble {
+    background: var(--accent); color: var(--accent-ink);
+    border-radius: 14px 4px 14px 14px;
+  }
+  .msg.assistant { align-items: flex-start; width: 100%; }
+  .msg.assistant .bubble {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 4px 14px 14px 14px;
+    font-family: var(--song); font-size: 16.5px;
+    box-shadow: 0 1px 3px rgba(60, 50, 20, .05);
+  }
+  .bubble .text { white-space: pre-wrap; }
+  .bubble .text:empty { display: none; }
+
+  /* 工具卡片：夹在助手回复中间 */
+  .tool {
+    margin: 10px 0; padding: 9px 13px;
+    background: var(--tool-bg); border: 1px solid var(--tool-line);
+    border-left: 3px solid var(--accent); border-radius: 8px;
+    font-family: var(--hei); font-size: 14px;
+    animation: rise .22s ease both;
+  }
+  .tool .tool-head {
+    display: flex; align-items: center; gap: 7px;
+    font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--accent);
+  }
+  .tool .tool-result {
+    margin-top: 5px; color: var(--ink-soft); font-size: 13.5px; line-height: 1.55;
+    white-space: pre-wrap; word-break: break-word;
+  }
+
+  /* 校验重试 / 错误 提示条 */
+  .notice {
+    max-width: 92%; margin: 8px 0 0; padding: 8px 14px;
+    border-radius: 8px; font-size: 14px; line-height: 1.55;
+    animation: rise .22s ease both;
+  }
+  .notice.warn { background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--warn-ink); }
+  .notice.error { background: var(--err-bg); border: 1px solid var(--err-line); color: var(--err-ink); }
+
+  /* trace 脚注 */
+  .trace-foot { max-width: 92%; margin-top: 5px; font-size: 11px; opacity: .5; }
+  .trace-foot a { color: var(--ink-soft); font-family: var(--mono); text-decoration: none; }
+  .trace-foot a:hover { color: var(--accent); opacity: 1; }
+
+  /* “思考中” 三点 */
+  .typing { display: inline-flex; gap: 5px; padding: 4px 2px; }
+  .typing i {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--ink-soft); opacity: .55;
+    animation: blink 1.1s infinite ease-in-out;
+  }
+  .typing i:nth-child(2) { animation-delay: .18s; }
+  .typing i:nth-child(3) { animation-delay: .36s; }
+  @keyframes blink { 0%, 70%, 100% { transform: translateY(0); opacity: .35; } 35% { transform: translateY(-4px); opacity: .9; } }
+
+  /* —— 底部输入区 —— */
+  footer {
+    flex: 0 0 auto;
+    padding: 14px 20px 18px;
+    background: var(--card); border-top: 1px solid var(--line);
+  }
+  .composer {
+    max-width: 780px; margin: 0 auto;
+    display: flex; gap: 12px; align-items: flex-end;
+  }
+  .composer textarea {
+    flex: 1; resize: none; min-height: 46px; max-height: 160px;
+    padding: 11px 15px; font-size: 16px; line-height: 1.5;
+    font-family: var(--hei); color: var(--ink);
+    background: var(--paper); border: 1px solid var(--line); border-radius: 12px;
+  }
+  .composer textarea:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
+  .composer button {
+    flex: 0 0 auto; height: 46px; padding: 0 24px;
+    border: none; border-radius: 12px;
+    background: var(--accent); color: var(--accent-ink);
+    font-size: 15px; font-weight: 700; letter-spacing: 2px; cursor: pointer;
+    transition: transform .12s ease, opacity .12s ease;
+  }
+  .composer button:hover:not(:disabled) { transform: translateY(-1px); }
+  .composer button:disabled { opacity: .45; cursor: not-allowed; }
+  .hint { max-width: 780px; margin: 8px auto 0; font-size: 12.5px; color: var(--ink-soft); }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Agent <small>工具调用 · RAG · 长期记忆 · 流式</small></h1>
+    <div class="spacer"></div>
+    <label class="session-box">
+      session
+      <input id="session" value="default" spellcheck="false" />
+    </label>
+    <a class="trace-link" href="/traces" target="_blank" rel="noopener">链路 ↗</a>
+  </header>
+
+  <main id="main">
+    <div class="feed" id="feed" aria-live="polite">
+      <div class="empty-tip" id="emptyTip">
+        输入一句话开始。试试：<br />
+       「查一下杭州天气」 · 「帮我加个待办：晚上跑步」 · 「记住我在杭州工作」
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="说点什么…  Enter 发送 / Shift+Enter 换行"></textarea>
+      <button id="send">发送</button>
+    </div>
+    <div class="hint">Enter 发送，Shift+Enter 换行。不同 session 的待办/历史互相隔离。</div>
+  </footer>
+
+<script>
+const $feed = document.getElementById("feed");
+const $empty = document.getElementById("emptyTip");
+const $input = document.getElementById("input");
+const $send = document.getElementById("send");
+const $session = document.getElementById("session");
+const $main = document.getElementById("main");
+
+$session.value = localStorage.getItem("agent_session") || "default";
+$session.addEventListener("change", () => localStorage.setItem("agent_session", $session.value.trim() || "default"));
+
+let busy = false;
+
+// textarea 自适应高度
+$input.addEventListener("input", () => {
+  $input.style.height = "auto";
+  $input.style.height = Math.min($input.scrollHeight, 160) + "px";
+});
+$input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+$send.addEventListener("click", send);
+
+function scrollBottom() { $main.scrollTop = $main.scrollHeight; }
+
+function addMsg(role) {
+  $empty?.remove();
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + role;
+  const who = document.createElement("div");
+  who.className = "who";
+  who.textContent = role === "user" ? "你" : "AGENT";
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  wrap.append(who, bubble);
+  $feed.appendChild(wrap);
+  return { wrap, bubble };
+}
+
+function setTyping(bubble, on) {
+  bubble.querySelector(".typing")?.remove();
+  if (on) {
+    const t = document.createElement("div");
+    t.className = "typing";
+    t.innerHTML = "<i></i><i></i><i></i>";
+    bubble.appendChild(t);
+    scrollBottom();
+  }
+}
+
+async function send() {
+  const text = $input.value.trim();
+  if (!text || busy) return;
+  busy = true; $send.disabled = true;
+
+  // 用户气泡
+  const u = addMsg("user");
+  u.bubble.textContent = text;
+  $input.value = "";
+  $input.style.height = "auto";
+  scrollBottom();
+
+  // 助手气泡（跨多个 round 复用同一个气泡）
+  const a = addMsg("assistant");
+  let textEl = null;
+  setTyping(a.bubble, true);
+
+  const ensureText = () => {
+    if (!textEl) {
+      setTyping(a.bubble, false);
+      textEl = document.createElement("div");
+      textEl.className = "text";
+      a.bubble.appendChild(textEl);
+    }
+    return textEl;
+  };
+  const addNotice = (kind, msg) => {
+    const n = document.createElement("div");
+    n.className = "notice " + kind;
+    n.textContent = msg;
+    a.wrap.appendChild(n);
+    scrollBottom();
+  };
+
+  try {
+    const resp = await fetch("/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: text,
+        session_id: $session.value.trim() || "default",
+        user_id: "default",
+      }),
+    });
+    if (!resp.ok || !resp.body) throw new Error("HTTP " + resp.status);
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      // SSE 帧以空行（\n\n）分隔
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 2);
+        const line = frame.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        const ev = JSON.parse(line.slice(5).trim());
+
+        switch (ev.type) {
+          case "round_start":
+            // 新一轮：旧文本段封存，工具卡片之后的新话会开新段
+            textEl = null;
+            setTyping(a.bubble, true);
+            break;
+          case "text":
+            ensureText().textContent += ev.content;
+            scrollBottom();
+            break;
+          case "tool_result": {
+            setTyping(a.bubble, false);
+            textEl = null;
+            const card = document.createElement("div");
+            card.className = "tool";
+            const head = document.createElement("div");
+            head.className = "tool-head";
+            const raw = ev.result || "";
+            const shown = raw.length > 200 ? raw.slice(0, 200) + "…" : raw;
+            head.textContent = "🔧 " + ev.name;
+            const result = document.createElement("div");
+            result.className = "tool-result";
+            result.textContent = shown;
+            card.append(head, result);
+            a.bubble.appendChild(card);
+            scrollBottom();
+            break;
+          }
+          case "claim_warning":
+            addNotice("warn", "校验：" + ev.message + "，已要求重新执行。");
+            break;
+          case "error":
+            addNotice("error", "出错了：" + ev.message);
+            break;
+          case "timeout":
+            addNotice("warn", "工具调用轮次超过上限，已停止。");
+            break;
+          case "final": {
+            setTyping(a.bubble, false);
+            if (ev.trace_id) {
+              const foot = document.createElement("div");
+              foot.className = "trace-foot";
+              const link = document.createElement("a");
+              link.href = "/traces/" + ev.trace_id;
+              link.target = "_blank";
+              link.rel = "noopener";
+              link.textContent = "trace " + ev.trace_id + " ↗";
+              foot.appendChild(link);
+              a.wrap.appendChild(foot);
+            }
+            break;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    setTyping(a.bubble, false);
+    addNotice("error", "连接失败：" + e.message);
+  } finally {
+    setTyping(a.bubble, false);
+    busy = false; $send.disabled = false;
+    $input.focus();
+  }
+}
+</script>
+</body>
+</html>

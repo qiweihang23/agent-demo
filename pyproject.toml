@@ -5,12 +5,24 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.115.0",
     "httpx>=0.28.1",
+    # 注意：mcp 2.x 把 FastMCP 改名 MCPServer 且 API 不兼容，本项目代码基于 1.x
+    "mcp>=1.2.0,<2",
     "openai>=3.14.1",
     "pydantic>=2.13.5",
     "pytest>=9.1.1",
     "python-dotenv>=1.2.3",
     "structlog>=26.1.0",
+    "uvicorn>=0.32.0",
+    # 知识库多格式解析
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+    "pdfplumber>=0.11.0",
+    "python-docx>=1.1.0",
+    "langgraph>=1.2.14",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "langchain-openai>=1.6.7",
 ]
 
 [[tool.uv.index]]

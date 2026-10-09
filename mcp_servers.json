@@ -1,0 +1,14 @@
+{
+  "agent-demo": {
+    "transport": "stdio",
+    "command": ["uv", "run", "python", "mcp_server.py"]
+  },
+  "fetch": {
+    "transport": "stdio",
+    "command": ["uvx", "mcp-server-fetch"]
+  },
+  "lark": {
+    "transport": "stdio",
+    "command": ["uv", "run", "python", "mcp_lark_server.py"]
+  }
+}
